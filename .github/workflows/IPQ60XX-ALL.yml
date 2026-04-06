@@ -6,12 +6,12 @@ on:
     - cron: 0 19 * * *
 
 env:
-  REPO_URL: https://github.com/xiongyumail/openwrt.git
-  REPO_BRANCH: ipq60xx
-  CONFIG_FILE: configs/ipq60xx-wifi(emmc).config
+  REPO_URL: https://github.com/breeze303/openwrt-6.x.git
+  REPO_BRANCH: main
+  CONFIG_FILE: configs/ipq60xx-all.config
   DIY_SCRIPT: diy-script.sh
   CLASH_KERNEL: amd64
-  CACHE_TOOLCHAIN: false
+  CACHE_TOOLCHAIN: true
   UPLOAD_BIN_DIR: false
   FIRMWARE_RELEASE: true
   FIRMWARE_TAG: IPQ60XX-ALL
@@ -19,10 +19,10 @@ env:
 
 jobs:
   Build:
-    runs-on: ubuntu-24.04  # 👈 已改成 ubuntu-24.04，自带CMake 3.32+
+    runs-on: ubuntu-24.04   # 必须使用 24.04，自带 CMake 3.31+
 
     steps:
-    - name: Check Server Performance(检查服务器性能)
+    - name: Check Server Performance
       run: |
         echo "警告⚠"
         echo "分配的服务器性能有限，若选择的插件过多，务必注意CPU性能！"
@@ -36,30 +36,32 @@ jobs:
         echo "--------------------------硬盘信息--------------------------"
         echo "硬盘数量：$(ls /dev/sd* | grep -v [1-9] | wc -l)" && df -hT
 
-    - name: Initialization Environment(初始化环境)
+    - name: Initialization Environment
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
-        sudo rm -rf /usr/share/dotnet /usr/local/lib/android $AGENT_TOOLSDIRECTORY
+        # 删除 docker rmi 行，避免无镜像时报错
+        sudo rm -rf /usr/share/dotnet /etc/apt/sources.list.d /usr/local/lib/android $AGENT_TOOLSDIRECTORY
         sudo -E apt-get -y purge azure-cli ghc* zulu* llvm* firefox google* dotnet* powershell openjdk* mongodb* moby* || true
         sudo -E apt-get -y update
-        sudo -E apt-get -y install $(curl -fsSL is.gd/depends_ubuntu_2204)
+        # Ubuntu 24.04 完整编译依赖（直接列出，避免网络问题）
+        sudo -E apt-get -y install build-essential clang flex bison g++ gawk gcc-multilib gettext git libelf-dev libncurses5-dev libssl-dev libstdc++6 python3-dev python3-pip python3-setuptools python3-distutils rsync unzip zlib1g-dev file wget subversion
         sudo -E systemctl daemon-reload
         sudo -E apt-get -y autoremove --purge
         sudo -E apt-get -y clean
         sudo timedatectl set-timezone "$TZ"
 
-    - name: Combine Disks(合并磁盘)
+    - name: Combine Disks
       uses: easimon/maximize-build-space@master
       with:
-        swap-size-mb: 2048
+        swap-size-mb: 1024
         temp-reserve-mb: 100
-        root-reserve-mb: 2048
+        root-reserve-mb: 1024
 
     - name: Checkout
       uses: actions/checkout@main
 
-    - name: Clone Source Code(克隆源代码)
+    - name: Clone Source Code
       run: |
         df -hT $GITHUB_WORKSPACE
         git clone $REPO_URL -b $REPO_BRANCH openwrt
@@ -68,52 +70,87 @@ jobs:
         VERSION_INFO=$(git show -s --date=short --format="作者: %an<br/>时间: %cd<br/>内容: %s<br/>hash: %H")
         echo "VERSION_INFO=$VERSION_INFO" >> $GITHUB_ENV
 
-    - name: Generate Variables(生成变量)
+    - name: Generate Variables
       run: |
-        cp $CONFIG_FILE $OPENWRT_PATH/.config
-        cd $OPENWRT_PATH
+        cp "$CONFIG_FILE" "$OPENWRT_PATH/.config"
+        cd "$OPENWRT_PATH"
         make defconfig > /dev/null 2>&1
         SOURCE_REPO="$(echo $REPO_URL | awk -F '/' '{print $(NF)}')"
         echo "SOURCE_REPO=$SOURCE_REPO" >> $GITHUB_ENV
-        DEVICE_TARGET=$(cat .config | grep CONFIG_TARGET_BOARD | awk -F '"' '{print $2}')
+        DEVICE_TARGET=$(grep CONFIG_TARGET_BOARD .config | awk -F '"' '{print $2}')
         echo "DEVICE_TARGET=$DEVICE_TARGET" >> $GITHUB_ENV
-        DEVICE_SUBTARGET=$(cat .config | grep CONFIG_TARGET_SUBTARGET | awk -F '"' '{print $2}')
+        DEVICE_SUBTARGET=$(grep CONFIG_TARGET_SUBTARGET .config | awk -F '"' '{print $2}')
         echo "DEVICE_SUBTARGET=$DEVICE_SUBTARGET" >> $GITHUB_ENV
 
-    - name: Install Feeds(安装feeds)
+    - name: Cache Toolchain
+      if: env.CACHE_TOOLCHAIN == 'true'
+      uses: HiGarfield/cachewrtbuild@main
+      with:
+        ccache: false
+        mixkey: ${{ env.SOURCE_REPO }}-${{ env.REPO_BRANCH }}-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}
+        prefix: ${{ env.OPENWRT_PATH }}
+
+    - name: Install Feeds
       run: |
-        cd $OPENWRT_PATH
+        cd "$OPENWRT_PATH"
         ./scripts/feeds update -a
         ./scripts/feeds install -a
-  
-    - name: Load Custom Configuration(加载自定义配置)
-      run: |
-        [ -e files ] && mv files $OPENWRT_PATH/files
-        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE $OPENWRT_PATH/.config
 
-    - name: Download DL Package(下载DL软件包)
+    - name: Run DIY Script
       run: |
-        cd $OPENWRT_PATH
+        cd "$OPENWRT_PATH"
+        if [ -f "../$DIY_SCRIPT" ]; then
+            bash "../$DIY_SCRIPT"
+        fi
+
+    - name: Download DL Package
+      run: |
+        cd "$OPENWRT_PATH"
         make defconfig
         make download -j8
-        find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
 
-    - name: Compile Firmware(开始编译固件)
+    - name: Compile Firmware
       id: compile
       run: |
-        cd $OPENWRT_PATH
-        make defconfig
+        cd "$OPENWRT_PATH"
+        # 使用单线程 + 详细输出，避免依赖乱序和日志截断
         make -j1 V=s
         echo "status=success" >> $GITHUB_OUTPUT
         echo "DATE=$(date +"%Y-%m-%d %H:%M:%S")" >> $GITHUB_ENV
         echo "FILE_DATE=$(date +"%Y.%m.%d")" >> $GITHUB_ENV
 
-    - name: Check Space Usage(检查空间使用情况)
+    - name: Check Space Usage
       if: (!cancelled())
       run: df -hT
 
-    - name: Upload Firmware To Release(发布固件)
+    - name: Upload Bin Directory
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+      uses: actions/upload-artifact@main
+      with:
+        name: ${{ env.SOURCE_REPO }}-bin-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}-${{ env.FILE_DATE }}
+        path: ${{ env.OPENWRT_PATH }}/bin
+
+    - name: Organize Files
+      if: steps.compile.outputs.status == 'success'
+      run: |
+        cd "$OPENWRT_PATH/bin/targets/$DEVICE_TARGET/$DEVICE_SUBTARGET"
+        cat sha256sums
+        cp "$OPENWRT_PATH/.config" build.config
+        mkdir -p packages
+        find "$OPENWRT_PATH/bin/packages" -name "*.ipk" -exec mv -f {} packages/ \;
+        tar -zcf Packages.tar.gz packages
+        rm -rf packages feeds.buildinfo version.buildinfo
+        echo "FIRMWARE_PATH=$PWD" >> $GITHUB_ENV
+
+    - name: Upload Firmware To Artifact
+      if: steps.compile.outputs.status == 'success' && env.FIRMWARE_RELEASE != 'true'
+      uses: actions/upload-artifact@main
+      with:
+        name: ${{ env.SOURCE_REPO }}-firmware-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}-${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE_PATH }}
+
+    - name: Upload Firmware To Release
       if: steps.compile.outputs.status == 'success' && env.FIRMWARE_RELEASE == 'true'
       uses: ncipollo/release-action@v1
       with:
@@ -131,3 +168,6 @@ jobs:
           - 💝 源码分支: ${{ env.REPO_BRANCH }}
           - 🌐 默认地址: 192.168.31.1
           - 🔑 默认密码: password
+          ### 🧊 固件版本
+          - 固件编译前最后一次➦[主源码](${{ env.REPO_URL }})更新记录
+          - ${{ env.VERSION_INFO }}
