@@ -1,35 +1,45 @@
 #!/bin/bash
 
 # ======================================================
-# 修复 LibWrt 定制版强制启用 APK 的问题
-# 目的：强制使用 opkg，避免 APK 干扰中文包和源配置
+# 修复 LibWrt 定制版强制启用 APK 的问题（增强版）
+# 目的：彻底禁用 APK，确保编译生成 ipk 包而非 apk
 # ======================================================
 
-# 修改 Config.in：将 USE_APK 的默认值改为 n
+# 1. 修改 Config.in：将 USE_APK 的默认值改为 n
 if grep -q "config USE_APK" Config.in; then
     sed -i '/config USE_APK/,/default/ s/default y/default n/' Config.in
     echo "已修改 Config.in: USE_APK 默认值改为 n"
 fi
 
-# 修改 include/package-pack.mk：确保 APK 相关逻辑被跳过
-if [ -f include/package-pack.mk ]; then
-    # 将条件判断 USE_APK 改为 ifneq ($(CONFIG_USE_APK),) 的相反逻辑
-    sed -i '/ifeq ($(CONFIG_USE_APK),)/{s/ifeq ($(CONFIG_USE_APK),)/ifneq ($(CONFIG_USE_APK),)/; t; s/ifneq ($(CONFIG_USE_APK),)/ifeq ($(CONFIG_USE_APK),)/;}' include/package-pack.mk
-    echo "已修改 include/package-pack.mk: 调整 APK 条件逻辑"
-fi
-
-# 修改 package/base-files/Makefile：避免生成 APK 配置目录
-if [ -f package/base-files/Makefile ]; then
-    # 将生成 /etc/apk 的块改为仅在 USE_APK=n 时生成 opkg 配置
-    sed -i '/mkdir -p $(1)\/etc\/apk/,/endef/ s/ifneq ($(CONFIG_USE_APK),)/ifeq ($(CONFIG_USE_APK),)/' package/base-files/Makefile
-    echo "已修改 package/base-files/Makefile: 禁止生成 APK 配置"
-fi
-
-# 强制在 .config 中禁用 APK
+# 2. 强制在 .config 中写入 CONFIG_USE_APK=n
 echo "CONFIG_USE_APK=n" >> .config
 
-# ================== 原脚本内容（已保留并整合）==================
-# 修改默认IP（如需修改请取消注释）
+# 3. 修改 include/package-pack.mk：将生成 .apk 的规则替换为生成 .ipk
+if [ -f include/package-pack.mk ]; then
+    cp include/package-pack.mk include/package-pack.mk.bak
+    # 将所有 .apk 后缀改为 .ipk
+    sed -i 's/\.apk/.ipk/g' include/package-pack.mk
+    # 将 apk 命令替换为 opkg
+    sed -i 's/apk/opkg/g' include/package-pack.mk
+    echo "已修改 include/package-pack.mk: 强制生成 ipk 包"
+fi
+
+# 4. 修改 rules.mk：禁用 APK 相关变量
+if [ -f rules.mk ]; then
+    sed -i 's/^APK[[:space:]]*=.*/APK=$(STAGING_DIR_HOST)\/bin\/opkg/' rules.mk
+    echo "已修改 rules.mk: APK 变量指向 opkg"
+fi
+
+# 5. 修改 package/Makefile：确保调用 opkg 而不是 apk
+if [ -f package/Makefile ]; then
+    sed -i 's/$(STAGING_DIR_HOST)\/bin\/apk/$(STAGING_DIR_HOST)\/bin\/opkg/g' package/Makefile
+    echo "已修改 package/Makefile"
+fi
+
+# 6. 删除可能存在的 apk 可执行文件（避免后续调用）
+rm -f staging_dir/host/bin/apk 2>/dev/null
+
+# 修改默认IP
 sed -i 's/192.168.31.1/10.0.0.1/g' package/base-files/files/bin/config_generate
 
 # ================== 第一步：更新 feeds ==================
@@ -157,5 +167,8 @@ fi
 
 # 2. 修改 LED 指示灯（将默认橙色改为蓝色，可选）
 find package/base-files -name "*leds*" -exec sed -i 's/orange/blue/g' {} \;
+
+# 3. 再次确保删除可能生成的 apk 工具（某些步骤可能重新生成）
+find staging_dir/host/bin -name "apk" -exec rm -f {} \;
 
 echo "DIY script completed."
